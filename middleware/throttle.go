@@ -81,6 +81,8 @@ func ThrottleWithOpts(opts ThrottleOpts) func(http.Handler) http.Handler {
 			select {
 
 			case <-ctx.Done():
+				// The client went away while waiting to enter the gate.
+				markSettlement(ctx, ReasonDisconnected)
 				t.setRetryAfterHeaderIfNeeded(w, true)
 				http.Error(w, errContextCanceled, t.statusCode)
 				return
@@ -109,6 +111,8 @@ func ThrottleWithOpts(opts ThrottleOpts) func(http.Handler) http.Handler {
 					http.Error(w, errTimedOut, t.statusCode)
 					return
 				case <-ctx.Done():
+					// The client went away while waiting in the backlog.
+					markSettlement(ctx, ReasonDisconnected)
 					timer.Stop()
 					t.setRetryAfterHeaderIfNeeded(w, true)
 					http.Error(w, errContextCanceled, t.statusCode)

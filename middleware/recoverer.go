@@ -24,10 +24,19 @@ func Recoverer(next http.Handler) http.Handler {
 		defer func() {
 			if rvr := recover(); rvr != nil {
 				if rvr == http.ErrAbortHandler {
+					// Record the abort reason on the shared settlement
+					// first, then keep propagating http.ErrAbortHandler so
+					// the response to the client is aborted, as before.
+					markSettlement(r.Context(), ReasonAborted)
 					// we don't recover http.ErrAbortHandler so the response
 					// to the client is aborted, this should not be logged
 					panic(rvr)
 				}
+
+				// Record the panic reason on the shared settlement before
+				// running the recovery logic; recovery itself never writes
+				// another settlement record.
+				markSettlement(r.Context(), ReasonPanic)
 
 				logEntry := GetLogEntry(r)
 				if logEntry != nil {

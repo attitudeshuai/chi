@@ -58,6 +58,80 @@ func RequestLogger(f LogFormatter) func(next http.Handler) http.Handler {
 	}
 }
 
+// SettlementExtra is passed as the extra argument to LogEntry.Write by
+// SettlingRequestLogger. It carries the single settlement reason of the
+// request. LogEntry implementations that do not know about it simply
+// ignore extra, so existing formatters keep working and keep their exact
+// output.
+type SettlementExtra struct {
+	Reason SettlementReason
+}
+
+// SettlingRequestLogger is RequestLogger with per-request settlement turned
+// on. It behaves like RequestLogger, except that:
+//
+//   - exactly one settlement record is written per request, even when the
+//     logger is mounted on several routers along one chain (for example a
+//     root router and mounted subrouters): only the outermost settling
+//     logger creates a [Settlement] and writes a record, inner layers share
+//     it and stay silent;
+//   - the Settlement is shared through the request context and its reason
+//     is first-wins, so a later layer can never overwrite an earlier one;
+//   - the reason is passed to LogEntry.Write as a [SettlementExtra] in the
+//     extra argument. [DefaultLogFormatter] renders it only when
+//     DefaultLogFormatter.WithReason is set, otherwise the output is
+//     byte-identical to RequestLogger's.
+//
+// Client disconnects and reached deadlines are observable before the
+// handler returns via [GetSettlement]; panics are marked by [Recoverer]
+// before recovery runs, and unmatched routes settle as [ReasonUnmatched].
+func SettlingRequestLogger(f LogFormatter) func(next http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		fn := func(w http.ResponseWriter, r *http.Request) {
+			// An outer settling layer (typically on a parent router) already
+			// owns this request's single settlement record: share it and do
+			// not write a second record for this request.
+			if GetSettlement(r.Context()) != nil {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			s := acquireSettlement()
+			r = WithSettlement(r, s)
+
+			entry := f.NewLogEntry(r)
+			ww := NewWrapResponseWriter(w, r.ProtoMajor)
+
+			t1 := time.Now()
+			stop := s.watch(r.Context())
+
+			defer func() {
+				stop()
+				if rvr := recover(); rvr != nil {
+					// No Recoverer handled this: record the outcome in the
+					// single settlement record first, then keep the panic
+					// propagating so existing behavior is unchanged.
+					if rvr == http.ErrAbortHandler {
+						s.Mark(ReasonAborted)
+					} else {
+						s.Mark(ReasonPanic)
+					}
+					entry.Write(ww.Status(), ww.BytesWritten(), ww.Header(), time.Since(t1), SettlementExtra{Reason: s.Reason()})
+					releaseSettlement(s)
+					panic(rvr)
+				}
+
+				finalizeSettlement(s, r)
+				entry.Write(ww.Status(), ww.BytesWritten(), ww.Header(), time.Since(t1), SettlementExtra{Reason: s.Reason()})
+				releaseSettlement(s)
+			}()
+
+			next.ServeHTTP(ww, WithLogEntry(r, entry))
+		}
+		return http.HandlerFunc(fn)
+	}
+}
+
 // LogFormatter initiates the beginning of a new LogEntry per request.
 // See DefaultLogFormatter for an example implementation.
 type LogFormatter interface {
@@ -92,6 +166,13 @@ type LoggerInterface interface {
 type DefaultLogFormatter struct {
 	Logger  LoggerInterface
 	NoColor bool
+
+	// WithReason appends the settlement reason (" reason=<reason>") to the
+	// record when the request was handled by SettlingRequestLogger and a
+	// reason could be determined. It is opt-in: when false, and for the
+	// plain RequestLogger, the output is unchanged. The status, byte count
+	// and elapsed fields are never altered.
+	WithReason bool
 }
 
 // NewLogEntry creates a new LogEntry for the request.
@@ -160,6 +241,15 @@ func (l *defaultLogEntry) Write(status, bytes int, header http.Header, elapsed t
 		cW(l.buf, l.useColor, nYellow, "%s", elapsed)
 	} else {
 		cW(l.buf, l.useColor, nRed, "%s", elapsed)
+	}
+
+	// Append the settlement reason only when explicitly enabled and only
+	// when a reason is available; everything above stays byte-identical.
+	if l.WithReason {
+		if se, ok := extra.(SettlementExtra); ok && se.Reason != "" {
+			l.buf.WriteString(" reason=")
+			l.buf.WriteString(string(se.Reason))
+		}
 	}
 
 	l.Logger.Print(l.buf.String())

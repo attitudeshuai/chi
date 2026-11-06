@@ -76,6 +76,24 @@ type Context struct {
 
 	methodsAllowed   []methodTyp // allowed methods in case of a 405
 	methodNotAllowed bool
+
+	// missed is set once a routing layer reaches its NotFound terminal
+	// because no route matched the request. A 405 Method Not Allowed does
+	// not set it: the path matched, only the method did not. It is read
+	// after the request was served and reset together with the rest of the
+	// pooled routing context.
+	missed bool
+}
+
+// Missed reports whether some routing layer served the request from its
+// NotFound terminal because no route matched. It is false for matched
+// routes, including a 405 Method Not Allowed response, and is reset for
+// every request (routing contexts are pooled).
+func (x *Context) Missed() bool {
+	if x == nil {
+		return false
+	}
+	return x.missed
 }
 
 // Reset a routing context to its initial state.
@@ -93,6 +111,7 @@ func (x *Context) Reset() {
 	x.methodNotAllowed = false
 	x.methodsAllowed = x.methodsAllowed[:0]
 	x.parentCtx = nil
+	x.missed = false
 }
 
 // Clone a routing context so that it may be used outside of the request/response

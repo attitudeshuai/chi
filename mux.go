@@ -494,6 +494,10 @@ func (mx *Mux) routeHTTP(w http.ResponseWriter, r *http.Request) {
 	if rctx.methodNotAllowed {
 		mx.MethodNotAllowedHandler(rctx.methodsAllowed...).ServeHTTP(w, r)
 	} else {
+		// Record the routing miss on the shared routing context before
+		// serving the NotFound terminal. The flag is request-scoped and is
+		// reset when the pooled routing context is recycled.
+		rctx.missed = true
 		mx.NotFoundHandler().ServeHTTP(w, r)
 	}
 }

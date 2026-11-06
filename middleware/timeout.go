@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"time"
 )
@@ -33,10 +34,25 @@ func Timeout(timeout time.Duration) func(next http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		fn := func(w http.ResponseWriter, r *http.Request) {
 			ctx, cancel := context.WithTimeout(r.Context(), timeout)
+			// Surface a reached deadline (or an earlier client cancel) on
+			// the shared settlement as soon as it happens, so the reason is
+			// readable before the handler returns rather than only here.
+			stop := watchRequestSettlement(ctx, r)
 			defer func() {
+				stop()
+				// Read the error before cancel(): canceling a deadline
+				// context that finished normally turns its error into
+				// context.Canceled.
+				ctxErr := ctx.Err()
 				cancel()
-				if ctx.Err() == context.DeadlineExceeded {
+				switch {
+				case errors.Is(ctxErr, context.DeadlineExceeded):
+					markSettlement(r.Context(), ReasonDeadline)
 					w.WriteHeader(http.StatusGatewayTimeout)
+				case errors.Is(ctxErr, context.Canceled):
+					// The parent request was canceled, typically by the
+					// client going away, before the timeout elapsed.
+					markSettlement(r.Context(), ReasonDisconnected)
 				}
 			}()
 
