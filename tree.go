@@ -392,6 +392,14 @@ func (n *node) FindRoute(rctx *Context, method methodTyp, path string) (*node, e
 		return nil, nil, nil
 	}
 
+	// A catch-all leaf carrying subroutes is a mount point: routing entered
+	// the wildcard and delegated the remainder to the mounted router. Record
+	// the attempt on this level before descending; it is only ever surfaced
+	// when the overall request ends up unmatched.
+	if d := rctx.routeDiag; d != nil && rn.typ == ntCatchAll && rn.subroutes != nil {
+		d.record(rn, d.level(), ntCatchAll, RouteDiagWildcardUncovered)
+	}
+
 	// Record the routing params in the request lifecycle
 	rctx.URLParams.Keys = append(rctx.URLParams.Keys, rctx.routeParams.Keys...)
 	rctx.URLParams.Values = append(rctx.URLParams.Values, rctx.routeParams.Values...)
@@ -411,6 +419,15 @@ func (n *node) findRoute(rctx *Context, method methodTyp, path string) *node {
 	nn := n
 	search := path
 
+	// Diagnostics are opt-in. When disabled, d stays nil and every record
+	// site below is a single untaken branch, so matching behaves and costs
+	// exactly as before.
+	d := rctx.routeDiag
+	level := 0
+	if d != nil {
+		level = d.level()
+	}
+
 	for t, nds := range nn.children {
 		ntyp := nodeTyp(t)
 		if len(nds) == 0 {
@@ -429,6 +446,9 @@ func (n *node) findRoute(rctx *Context, method methodTyp, path string) *node {
 		case ntStatic:
 			xn = nds.findEdge(label)
 			if xn == nil || !strings.HasPrefix(xsearch, xn.prefix) {
+				if d != nil {
+					d.record(xn, level, ntStatic, RouteDiagPrefixMismatch)
+				}
 				continue
 			}
 			xsearch = xsearch[len(xn.prefix):]
@@ -436,6 +456,9 @@ func (n *node) findRoute(rctx *Context, method methodTyp, path string) *node {
 		case ntParam, ntRegexp:
 			// short-circuit and return no matching route for empty param values
 			if xsearch == "" {
+				if d != nil {
+					d.record(nil, level, ntyp, RouteDiagParamEmpty)
+				}
 				continue
 			}
 
@@ -448,18 +471,30 @@ func (n *node) findRoute(rctx *Context, method methodTyp, path string) *node {
 					if xn.tail == '/' {
 						p = len(xsearch)
 					} else {
+						if d != nil {
+							d.record(xn, level, ntyp, RouteDiagParamMismatch)
+						}
 						continue
 					}
 				} else if ntyp == ntRegexp && p == 0 {
+					if d != nil {
+						d.record(xn, level, ntyp, RouteDiagParamEmpty)
+					}
 					continue
 				}
 
 				if ntyp == ntRegexp && xn.rex != nil {
 					if !xn.rex.MatchString(xsearch[:p]) {
+						if d != nil {
+							d.record(xn, level, ntyp, RouteDiagRegexpMismatch)
+						}
 						continue
 					}
 				} else if strings.IndexByte(xsearch[:p], '/') != -1 {
 					// avoid a match across path segments
+					if d != nil {
+						d.record(xn, level, ntyp, RouteDiagParamMismatch)
+					}
 					continue
 				}
 
@@ -487,6 +522,9 @@ func (n *node) findRoute(rctx *Context, method methodTyp, path string) *node {
 						// flag that the routing context found a route, but not a corresponding
 						// supported method
 						rctx.methodNotAllowed = true
+						if d != nil {
+							d.record(xn, level, ntyp, RouteDiagMethodNotAllowed)
+						}
 					}
 				}
 
@@ -494,6 +532,12 @@ func (n *node) findRoute(rctx *Context, method methodTyp, path string) *node {
 				fin := xn.findRoute(rctx, method, xsearch)
 				if fin != nil {
 					return fin
+				}
+
+				// the segment value fit this parameter branch, but no route
+				// beneath it covered the remainder of the path
+				if d != nil && !(len(xsearch) == 0 && xn.isLeaf()) {
+					d.record(xn, level, ntyp, RouteDiagNoRoute)
 				}
 
 				// not found on this branch, reset vars
@@ -535,6 +579,15 @@ func (n *node) findRoute(rctx *Context, method methodTyp, path string) *node {
 				// flag that the routing context found a route, but not a corresponding
 				// supported method
 				rctx.methodNotAllowed = true
+				if d != nil {
+					d.record(xn, level, xn.typ, RouteDiagMethodNotAllowed)
+				}
+			} else if ntyp == ntCatchAll {
+				// the catch-all consumed the rest of the path but has no
+				// terminal handler covering it
+				if d != nil {
+					d.record(xn, level, ntCatchAll, RouteDiagWildcardUncovered)
+				}
 			}
 		}
 

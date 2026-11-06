@@ -76,6 +76,11 @@ type Context struct {
 
 	methodsAllowed   []methodTyp // allowed methods in case of a 405
 	methodNotAllowed bool
+
+	// routeDiag collects route-match diagnostics for the request. It is
+	// non-nil only when diagnostics were explicitly enabled for this
+	// context, so routing without diagnostics does no collection work.
+	routeDiag *routeDiag
 }
 
 // Reset a routing context to its initial state.
@@ -93,6 +98,7 @@ func (x *Context) Reset() {
 	x.methodNotAllowed = false
 	x.methodsAllowed = x.methodsAllowed[:0]
 	x.parentCtx = nil
+	x.routeDiag = nil
 }
 
 // Clone a routing context so that it may be used outside of the request/response
@@ -116,7 +122,53 @@ func (x *Context) Clone() *Context {
 	clone.RoutePatterns = slices.Clone(x.RoutePatterns)
 	clone.methodsAllowed = slices.Clone(x.methodsAllowed)
 
+	if x.routeDiag != nil {
+		d := &routeDiag{
+			depth:   x.routeDiag.depth,
+			decided: x.routeDiag.decided,
+			matched: x.routeDiag.matched,
+			mna:     x.routeDiag.mna,
+			allowed: slices.Clone(x.routeDiag.allowed),
+		}
+		d.attempts = make([]routeDiagAttempt, len(x.routeDiag.attempts))
+		for i, a := range x.routeDiag.attempts {
+			a.allowed = slices.Clone(a.allowed)
+			d.attempts[i] = a
+		}
+		clone.routeDiag = d
+	}
+
 	return &clone
+}
+
+// EnableRouteDiagnostics turns on collection of route-match diagnostics for
+// this routing context, i.e. for this request only. It must be called before
+// routing happens, typically from a middleware registered with Mux.Use (the
+// routing context is available there but routing has not run yet) or before
+// calling Mux.Match/Mux.Find on a manually obtained context.
+//
+// Collection is opt-in: without this call, routing takes the same path with
+// the same cost as a router without diagnostics. A request that ultimately
+// matches exposes no report, and collection never allocates beyond the
+// collector on an ordinary matched request. Diagnostics never affect the
+// response or route selection; retrieve the result after routing with
+// RouteDiagnostics.
+func (x *Context) EnableRouteDiagnostics() {
+	x.routeDiag = newRouteDiag()
+}
+
+// RouteDiagnostics returns the stable, detached diagnostics report for a
+// request that did not match. It returns nil when diagnostics were not
+// enabled, routing has not reached a decision yet, or the request matched.
+//
+// A typical read point is a custom NotFound/MethodNotAllowed handler, or a
+// middleware after the router has written its response. The returned report
+// is a copy and remains valid after the context is reset and reused.
+func (x *Context) RouteDiagnostics() *RouteDiagnostics {
+	if x.routeDiag == nil {
+		return nil
+	}
+	return x.routeDiag.snapshot()
 }
 
 // URLParam returns the corresponding URL parameter value from the request

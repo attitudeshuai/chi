@@ -63,6 +63,13 @@ func NewMux() *Mux {
 func (mx *Mux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Ensure the mux has some routes defined on the mux
 	if mx.handler == nil {
+		// An empty router can still be a mounted subrouter, in which case a
+		// parent request is waiting for its decision.
+		if rctx, _ := r.Context().Value(RouteCtxKey).(*Context); rctx != nil {
+			if d := rctx.routeDiag; d != nil {
+				d.markMiss(false, nil)
+			}
+		}
 		mx.NotFoundHandler().ServeHTTP(w, r)
 		return
 	}
@@ -380,8 +387,16 @@ func (mx *Mux) Match(rctx *Context, method, path string) bool {
 // Note: the *Context state is updated during execution, so manage
 // the state carefully or make a NewRouteContext().
 func (mx *Mux) Find(rctx *Context, method, path string) string {
+	if d := rctx.routeDiag; d != nil {
+		d.enterLevel()
+		defer d.leaveLevel()
+	}
+
 	m, ok := methodMap[method]
 	if !ok {
+		if d := rctx.routeDiag; d != nil {
+			d.markMiss(true, nil)
+		}
 		return ""
 	}
 
@@ -391,17 +406,31 @@ func (mx *Mux) Find(rctx *Context, method, path string) string {
 	if node != nil {
 		if node.subroutes == nil {
 			e := node.endpoints[m]
+			if d := rctx.routeDiag; d != nil {
+				d.markMatched()
+			}
 			return e.pattern
 		}
 
 		rctx.RoutePath = mx.nextRoutePath(rctx)
 		subPattern := node.subroutes.Find(rctx, method, rctx.RoutePath)
 		if subPattern == "" {
+			// A chi subrouter already recorded the decisive outcome; fall
+			// back to a miss for other Routes implementations that did not.
+			if d := rctx.routeDiag; d != nil && !d.decided {
+				d.markMiss(rctx.methodNotAllowed, rctx.methodsAllowed)
+			}
 			return ""
+		}
+
+		if d := rctx.routeDiag; d != nil {
+			d.markMatched()
 		}
 
 		pattern = strings.TrimSuffix(pattern, "/*")
 		pattern += subPattern
+	} else if d := rctx.routeDiag; d != nil {
+		d.markMiss(rctx.methodNotAllowed, rctx.methodsAllowed)
 	}
 
 	return pattern
@@ -456,6 +485,13 @@ func (mx *Mux) routeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Grab the route context object
 	rctx := r.Context().Value(RouteCtxKey).(*Context)
 
+	// Track the mount depth for diagnostics; calls nest as a matched mount
+	// handler dispatches into the mounted router.
+	if d := rctx.routeDiag; d != nil {
+		d.enterLevel()
+		defer d.leaveLevel()
+	}
+
 	// The request routing path
 	routePath := rctx.RoutePath
 	if routePath == "" {
@@ -475,12 +511,21 @@ func (mx *Mux) routeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	method, ok := methodMap[rctx.RouteMethod]
 	if !ok {
+		if d := rctx.routeDiag; d != nil {
+			d.markMiss(true, nil)
+		}
 		mx.MethodNotAllowedHandler().ServeHTTP(w, r)
 		return
 	}
 
 	// Find the route
 	if _, _, h := mx.tree.FindRoute(rctx, method, routePath); h != nil {
+		// Provisionally a match; a mounted router served by h may still turn
+		// the overall request into a miss, and its decision wins.
+		if d := rctx.routeDiag; d != nil {
+			d.markMatched()
+		}
+
 		// Set http.Request path values from our request context
 		for i, key := range rctx.URLParams.Keys {
 			value := rctx.URLParams.Values[i]
@@ -490,6 +535,9 @@ func (mx *Mux) routeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		h.ServeHTTP(w, r)
 		return
+	}
+	if d := rctx.routeDiag; d != nil {
+		d.markMiss(rctx.methodNotAllowed, rctx.methodsAllowed)
 	}
 	if rctx.methodNotAllowed {
 		mx.MethodNotAllowedHandler(rctx.methodsAllowed...).ServeHTTP(w, r)
